@@ -1,0 +1,133 @@
+name: Frontend Continuous Deployment
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "starter/frontend/**"
+      - ".github/workflows/frontend-cd.yaml"
+  workflow_dispatch:
+
+env:
+  # URL of the deployed backend (e.g. http://<backend-loadbalancer-dns>), set as a repository variable.
+  REACT_APP_MOVIE_API_URL: ${{ vars.REACT_APP_MOVIE_API_URL || 'http://localhost:5000' }}
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: frontend
+  EKS_CLUSTER_NAME: cluster
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: starter/frontend
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup NodeJS
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: starter/frontend/.nvmrc
+      - name: Restore npm cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('starter/frontend/package-lock.json') }}
+          restore-keys: |
+            npm-${{ runner.os }}-
+      - name: Install dependencies
+        run: npm ci
+      - name: Run lint
+        run: npm run lint
+
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: starter/frontend
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup NodeJS
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: starter/frontend/.nvmrc
+      - name: Restore npm cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('starter/frontend/package-lock.json') }}
+          restore-keys: |
+            npm-${{ runner.os }}-
+      - name: Install dependencies
+        run: npm ci
+      - name: Run tests
+        run: npm run test
+        env:
+          CI: "true"
+
+  build:
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Login to Amazon ECR Public (avoids pull rate limits)
+        continue-on-error: true
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Compute image reference
+        id: meta
+        run: echo "image=${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build and push Docker image to ECR
+        uses: docker/build-push-action@v6
+        with:
+          context: starter/frontend
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          build-args: |
+            REACT_APP_MOVIE_API_URL=${{ env.REACT_APP_MOVIE_API_URL }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: starter/frontend/k8s
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Update kubeconfig for EKS
+        run: aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+      - name: Set image tag in kustomization
+        run: kustomize edit set image frontend=${{ needs.build.outputs.image }}
+      - name: Apply Kubernetes manifests
+        run: kustomize build | kubectl apply -f -
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/frontend --timeout=300s
+      - name: Show services
+        run: kubectl get svc -o wide
